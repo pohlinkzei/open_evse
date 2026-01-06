@@ -501,8 +501,8 @@ extern AutoCurrentCapacityController g_ACCController;
 #define CHARGINGAC_IDX 1
 
 // obsolete LED pin
-//#define RED_LED_REG &PIND
-//#define RED_LED_IDX 5
+#define RED_LED_REG &PINC
+#define RED_LED_IDX 5
 // obsolete LED pin
 //#define GREEN_LED_REG &PINB
 //#define GREEN_LED_IDX 5
@@ -731,7 +731,7 @@ extern AutoCurrentCapacityController g_ACCController;
 
 #ifdef TEMPERATURE_MONITORING
 
-#define MCP9808_IS_ON_I2C    // Use the MCP9808 connected to I2C
+//#define MCP9808_IS_ON_I2C    // Use the MCP9808 connected to I2C
 //#define TMP007_IS_ON_I2C     // Use the TMP007 IR sensor on I2C
 #define TEMPERATURE_DISPLAY_ALWAYS 0     // Set this flag to 1 to always show temperatures on the bottom line of the 16X2 LCD
                                          // Set to it 0 to only display when temperatures become elevated
