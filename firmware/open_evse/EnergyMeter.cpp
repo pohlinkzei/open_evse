@@ -61,7 +61,17 @@ void EnergyMeter::calcUsage()
   unsigned long dms = curms - m_lastUpdateMs;
   if (dms > KWH_CALC_INTERVAL_MS) {
       uint32_t mv = g_EvseController.GetVoltage();
+#ifdef PHASE_SWITCHING
+      // Sum per-phase currents - works for 1-phase EVs in 1-phase or
+      // 3-phase mode, for 2-phase EVs (e-Golf style) in 3-phase mode, and
+      // for real 3-phase EVs alike. mv is phase-to-neutral voltage, so
+      // total power is U * (I_L1 + I_L2 + I_L3).
+      uint32_t ma = (uint32_t)g_EvseController.GetChargingCurrentL1()
+                  + (uint32_t)g_EvseController.GetChargingCurrentL2()
+                  + (uint32_t)g_EvseController.GetChargingCurrentL3();
+#else
       uint32_t ma = g_EvseController.GetChargingCurrent();
+#endif // PHASE_SWITCHING
       /*
        * The straightforward formula to compute 'milliwatt-seconds' would be:
        *     mws = (mv/1000) * (ma/1000) * dms;
@@ -90,12 +100,14 @@ void EnergyMeter::calcUsage()
        * complex, only requires one divide operation.
        */
       uint32_t mws = (mv/16) * (ma/4) / 15625 * dms;
-#ifdef THREEPHASE
+#if defined(THREEPHASE) && !defined(PHASE_SWITCHING)
       // Multiply calculation by 3 to get 3-phase energy.
       // Typically you'd multiply by sqrt(3), but because voltage is measured to
       // ground (230V) rather than between phases (400 V), 3 is the correct multiple.
+      // Skipped when PHASE_SWITCHING is enabled because in that case ma is
+      // already the sum across L1+L2+L3 measured per-phase.
       mws *= 3;
-#endif // THREEPHASE
+#endif // THREEPHASE && !PHASE_SWITCHING
       // convert milliwatt-seconds to watt-seconds and increment counter
       m_wattSeconds += mws / 1000;
 

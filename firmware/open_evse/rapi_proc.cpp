@@ -436,6 +436,16 @@ int EvseRapiProcessor::processCmd()
       }
       break;
 #endif // MENNEKES_LOCK
+#ifdef PHASE_SWITCHING
+    case 'P': // set requested phases (1 or 3)
+      if (tokenCnt == 2) {
+        u1.u8 = (uint8_t)dtou32(tokens[1]);
+        rc = g_EvseController.SetRequestedPhases(u1.u8);
+        sprintf(buffer,"%d",(int)g_EvseController.GetActualPhases());
+        bufCnt = 1;
+      }
+      break;
+#endif // PHASE_SWITCHING
 #ifdef AMMETER
     case 'A':
       if (tokenCnt == 3) {
@@ -747,6 +757,26 @@ int EvseRapiProcessor::processCmd()
       rc = 0;
       break;
 #endif // VOLTMETER
+#ifdef PHASE_SWITCHING
+    case 'N': // per-phase currents in mA
+      sprintf(buffer,"%ld %ld %ld",
+              g_EvseController.GetChargingCurrentL1(),
+              g_EvseController.GetChargingCurrentL2(),
+              g_EvseController.GetChargingCurrentL3());
+      bufCnt = 1;
+      rc = 0;
+      break;
+    case 'W': // phase switching state
+      sprintf(buffer,"%d %d %d %lu %d",
+              (int)g_EvseController.GetActualPhases(),
+              (int)g_EvseController.GetRequestedPhases(),
+              (int)g_EvseController.IsPhaseSwitching(),
+              g_EvseController.GetPhaseLockoutRemainingMs(),
+              (int)g_EvseController.GetObservedPhases());
+      bufCnt = 1;
+      rc = 0;
+      break;
+#endif // PHASE_SWITCHING
 #ifdef TEMPERATURE_MONITORING
 #ifdef TEMPERATURE_MONITORING_NY
     case 'O':

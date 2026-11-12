@@ -142,6 +142,10 @@ class J1772EVSEController {
 #ifdef CURRENT_PIN
   AdcPin adcCurrent;
 #endif
+#ifdef PHASE_SWITCHING
+  AdcPin adcCurrentL2;
+  AdcPin adcCurrentL3;
+#endif // PHASE_SWITCHING
 #ifdef VOLTMETER_PIN
   AdcPin adcVoltMeter;
 #endif
@@ -155,6 +159,9 @@ class J1772EVSEController {
 #ifdef CHARGINGAC_REG
   DigitalPin pinChargingAC;
 #endif
+#ifdef PHASE_SWITCHING
+  DigitalPin pinPhaseContactor;
+#endif // PHASE_SWITCHING
 #ifdef ACLINE1_REG
   DigitalPin pinAC1;
 #endif
@@ -265,6 +272,18 @@ class J1772EVSEController {
   int32_t m_ChargingCurrent;
   int16_t m_AmmeterCurrentOffset;
   int16_t m_CurrentScaleFactor;
+#ifdef PHASE_SWITCHING
+  // Per-phase ammeter raw RMS readings (counts) and derived currents (mA).
+  unsigned long m_AmmeterReadingL2;
+  unsigned long m_AmmeterReadingL3;
+  int32_t m_ChargingCurrentL2;
+  int32_t m_ChargingCurrentL3;
+  int16_t m_CurrentScaleFactorL2;
+  int16_t m_CurrentScaleFactorL3;
+  // Sample one of the three CT channels. Updates the corresponding
+  // m_AmmeterReadingLx member. phase: 0=L1, 1=L2, 2=L3.
+  void readAmmeterPhase(uint8_t phase);
+#endif // PHASE_SWITCHING
 #ifdef CHARGE_LIMIT
   uint8_t m_chargeLimitkWh; // kWh to extend session
   uint32_t m_chargeLimitTotWs; // total Ws limit
@@ -284,6 +303,40 @@ class J1772EVSEController {
   uint8_t       m_HsTriggered;  // Will be 0 if HEARTBEAT_SUPERVISION has never had a missed pulse
   unsigned long m_HsLastPulse;  // The last time we saw a HS pulse or the last time m_HsInterval elpased without seeing one.  Set to 0 if HEARTBEAT_SUPERVISION triggered                                   
 #endif //HEARTBEAT_SUPERVISION
+
+#ifdef PHASE_SWITCHING
+  // Phase switching finite state machine.
+  // Initial value is set in Init() such that K2 starts in the safe (open)
+  // state which corresponds to 1-phase operation.
+  enum PhaseFsmState : uint8_t {
+    PFS_IDLE = 0,           // no transition in progress
+    PFS_PAUSE_PILOT,        // pilot pulled to State B, waiting for I=0
+    PFS_OPEN_K1,            // K1 just commanded open, settling
+    PFS_SWITCH_K2,          // K2 just commanded to new pos, settling
+    PFS_RESUME_PILOT,       // pilot rearmed, waiting for EV to take charge
+    PFS_PLAUSIBILITY_GRACE  // K1 closed again, waiting before checking strom-Muster
+  };
+  uint8_t  m_PhasesRequested;          // 1 or 3, last user/evcc request
+  uint8_t  m_PhasesActual;             // 1 or 3, what K2 currently provides
+  uint8_t  m_PhasesObserved;           // 1, 2 (e-Golf), or 3 - measured
+  uint8_t  m_PhaseFsmState;            // PFS_xxx
+  unsigned long m_PhaseFsmStateMs;     // millis() when current FSM state was entered
+  unsigned long m_PhaseLastSwitchMs;   // millis() of last completed K2 transition
+  uint8_t  m_PhaseSwitchPending;       // 1 if request != actual and lockout cleared
+
+  void UpdatePhaseSwitching();
+  // Direct K2 driver. Internal use only; the FSM is the only path that
+  // calls this so that all safety preconditions are enforced.
+  void setPhaseContactor(uint8_t close);
+  uint8_t getPhaseContactor();
+  // Observe per-phase currents and update m_PhasesObserved. Called on a
+  // slow tick from Update() after the plausibility grace has expired.
+  void UpdatePhasesObserved();
+#endif // PHASE_SWITCHING
+
+#ifdef RDC_DD
+  unsigned long m_RdcDdLastSelfTestMs;
+#endif // RDC_DD
 
 public:
   J1772EVSEController();
@@ -490,11 +543,32 @@ int GetHearbeatTrigger();
     else clrVFlags(ECVF_AMMETER_CAL);
   }
 #endif // ECVF_AMMETER_CAL
-  void ZeroChargingCurrent() { m_ChargingCurrent = 0; }
+  void ZeroChargingCurrent() {
+    m_ChargingCurrent = 0;
+#ifdef PHASE_SWITCHING
+    m_ChargingCurrentL2 = 0;
+    m_ChargingCurrentL3 = 0;
+#endif // PHASE_SWITCHING
+  }
   uint8_t GetInstantaneousChargingAmps() {
     readAmmeter();
     return m_AmmeterReading / 1000;
   }
+#ifdef PHASE_SWITCHING
+  int32_t GetChargingCurrentL1() { return m_ChargingCurrent; }
+  int32_t GetChargingCurrentL2() { return m_ChargingCurrentL2; }
+  int32_t GetChargingCurrentL3() { return m_ChargingCurrentL3; }
+  int16_t GetCurrentScaleFactorL2() { return m_CurrentScaleFactorL2; }
+  int16_t GetCurrentScaleFactorL3() { return m_CurrentScaleFactorL3; }
+  void SetCurrentScaleFactorL2(int16_t scale) {
+    m_CurrentScaleFactorL2 = scale;
+    eeprom_write_word((uint16_t*)EOFS_CURRENT_SCALE_FACTOR_L2,scale);
+  }
+  void SetCurrentScaleFactorL3(int16_t scale) {
+    m_CurrentScaleFactorL3 = scale;
+    eeprom_write_word((uint16_t*)EOFS_CURRENT_SCALE_FACTOR_L3,scale);
+  }
+#endif // PHASE_SWITCHING
 #ifdef CHARGE_LIMIT
   void ClrChargeLimit() {
     m_chargeLimitTotWs = 0;
@@ -591,6 +665,28 @@ int GetHearbeatTrigger();
   void LockMennekes() { m_MennekesLock.Lock(1); }
   void UnlockMennekes() { m_MennekesLock.Unlock(1); }
 #endif // MENNEKES_LOCK
+
+#ifdef PHASE_SWITCHING
+  // Request a phase configuration. phases must be 1 or 3. Returns:
+  //   0 = accepted, transition will begin (or already in target)
+  //   1 = rejected: lockout active
+  //   2 = rejected: EVSE in fault state
+  //   3 = rejected: invalid value
+  uint8_t SetRequestedPhases(uint8_t phases);
+  uint8_t GetRequestedPhases() { return m_PhasesRequested; }
+  uint8_t GetActualPhases() { return m_PhasesActual; }
+  uint8_t GetObservedPhases() { return m_PhasesObserved; }
+  uint8_t IsPhaseSwitching() { return (m_PhaseFsmState != PFS_IDLE) ? 1 : 0; }
+  // Remaining lockout time in milliseconds (0 if lockout cleared).
+  unsigned long GetPhaseLockoutRemainingMs();
+#endif // PHASE_SWITCHING
+
+#ifdef RDC_DD
+  // Re-run the external RDC-DD self test. Returns 0 on success. Updates
+  // m_RdcDdLastSelfTestMs on success.
+  uint8_t RunRdcDdSelfTest();
+  unsigned long GetRdcDdLastSelfTestMs() { return m_RdcDdLastSelfTestMs; }
+#endif // RDC_DD
 
 };
 

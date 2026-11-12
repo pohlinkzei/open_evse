@@ -92,6 +92,32 @@ typedef unsigned long time_t;
 // Note: three-phase energy will always be calculated even if EV is only using singe-phase. Ony enable if always charging 3-phase EV and aware of this limitation.
 //#define THREEPHASE
 
+// PHASE_SWITCHING: enable automatic 1ph/3ph switching driven by external
+// requester (evcc via ESP32 -> RAPI $SP). When defined:
+//   - K1 (main contactor, L1+N) is driven by the existing 230V AC relay
+//     output (CHARGINGAC_REG) via chargingOn()/chargingOff().
+//   - K2 (phase contactor, L2+L3) is driven by PHASE_CONTACTOR_REG/IDX
+//     independently of chargingOn(). K2 is NOT touched by chargingOn/Off.
+//   - readAmmeter() additionally samples AMMETER_L2_PIN and AMMETER_L3_PIN
+//     to provide per-phase current readings used for the I=0 plausibility
+//     check before any K2 transition and for kWh calculation.
+//   - EnergyMeter sums U * (I_L1 + I_L2 + I_L3) instead of using a fixed
+//     phase multiplier.
+//   - A hard 60s anti-hunt lockout is enforced between two K2 transitions.
+//   - New RAPI commands: $SP (set phases), $GW (get phase state), $GN
+//     (get per-phase currents) are exposed.
+//#define PHASE_SWITCHING
+
+// RDC_DD: replaces the on-board residual current CT with an external
+// all-current-sensitive residual current monitoring device (Type B
+// compatible, AC >= 30 mA, DC >= 6 mA, per IEC 62955). When defined:
+//   - GFI trip input keeps the existing semantics (pin goes high -> trip).
+//   - On a DC residual trip the EVSE never auto-retries; manual reset is
+//     required (GFI_RETRY_COUNT is treated as 0).
+//   - A periodic self-test is performed every RDC_DD_SELFTEST_INTERVAL_MS
+//     in addition to the boot-time self-test.
+//#define RDC_DD
+
 // charging access control - if defined, enables RAPI G4/S4 commands
 //  to enable/disable charging function
 // if AUTH_LOCK_REG/IDX are also defined (see below), then a hardware pin is
@@ -460,9 +486,23 @@ extern AutoCurrentCapacityController g_ACCController;
 
 //J1772EVSEController
 
-#define CURRENT_PIN 0 // analog current reading pin ADCx
+#define CURRENT_PIN 0 // analog current reading pin ADCx (L1 in 3-phase setups)
 #define PILOT_PIN 1 // analog pilot voltage reading pin ADCx
 #define PP_PIN 2 // PP_READ - ADC2
+
+#ifdef PHASE_SWITCHING
+// Per-phase CT inputs for L2 and L3. Wire two additional CTs identical to
+// the L1 input (same burden resistor, same bias divider) to two free ADC
+// pins of the AVR. Defaults below assume ADC6 and ADC7 are free (which is
+// true for the standard OEv5/v6 builds when no I2C extras occupy them).
+// Override at the platformio.ini / build-flag level if needed.
+#ifndef AMMETER_L2_PIN
+#define AMMETER_L2_PIN 6 // analog current reading pin for L2 (ADC6)
+#endif
+#ifndef AMMETER_L3_PIN
+#define AMMETER_L3_PIN 7 // analog current reading pin for L3 (ADC7)
+#endif
+#endif // PHASE_SWITCHING
 #ifdef VOLTMETER
 // N.B. Note, ADC2 is already used as PP_PIN so beware of potential clashes
 // voltmeter pin is ADC2 on OPENEVSE_2
@@ -499,6 +539,23 @@ extern AutoCurrentCapacityController g_ACCController;
 //digital Charging pin for AC relay
 #define CHARGINGAC_REG &PINB
 #define CHARGINGAC_IDX 1
+
+#ifdef PHASE_SWITCHING
+// Hardware mapping:
+//   K1 (L1+N, 230V AC contactor) -> CHARGINGAC_REG/IDX (existing AC SSR
+//      output). Driven by chargingOn()/chargingOff().
+//   K2 (L2+L3, 12V DC contactor) -> PHASE_CONTACTOR_REG/IDX. Driven
+//      exclusively by the phase-switching FSM, NOT by chargingOn/Off.
+//      A free-wheel diode (1N4007/SB1100) MUST be present across the
+//      external 12V coil.
+// Default: reuse CHARGING2_REG/IDX (the 2nd 12V auxiliary output of the
+// OEv5/v6 board). This requires that CHARGING2 is not also wired to a
+// chargingOn-driven load on this build.
+#ifndef PHASE_CONTACTOR_REG
+#define PHASE_CONTACTOR_REG CHARGING2_REG
+#define PHASE_CONTACTOR_IDX CHARGING2_IDX
+#endif
+#endif // PHASE_SWITCHING
 
 // obsolete LED pin
 //#define RED_LED_REG &PIND
@@ -578,6 +635,14 @@ extern AutoCurrentCapacityController g_ACCController;
 
 #define EOFS_RELAY_CLOSE_MS 37 // 1 byte
 #define EOFS_RELAY_HOLD_PWM 38 // 1 byte
+
+#ifdef PHASE_SWITCHING
+// Per-phase ammeter scale factors for L2 and L3 (L1 uses the existing
+// EOFS_CURRENT_SCALE_FACTOR slot). Allows per-CT calibration.
+#define EOFS_CURRENT_SCALE_FACTOR_L2 39 // 2 bytes
+#define EOFS_CURRENT_SCALE_FACTOR_L3 41 // 2 bytes
+// EOFS 43..44 reserved for future per-phase offsets if needed
+#endif // PHASE_SWITCHING
 
 #define EOFS_MAX_HW_CURRENT_CAPACITY 511 // 1 byte
 
@@ -728,6 +793,44 @@ extern AutoCurrentCapacityController g_ACCController;
 #define CURRENT_ZERO_DEBOUNCE_INTERVAL 5
 
 #endif // AMMETER
+
+#ifdef PHASE_SWITCHING
+// Hard anti-hunt lockout enforced in firmware. evcc may add its own larger,
+// EV-friendly cool-down on top of this. NEVER reduce below ~30s without
+// reviewing K2 contactor wear and EV restart-behaviour first.
+#define PHASE_SWITCH_LOCKOUT_MS 60000UL
+// Threshold below which a phase current is considered "off" for the pre-K2
+// plausibility check. In milliamps.
+#define PHASE_SWITCH_I_OFF_THRESHOLD_MA 500
+// Threshold above which a phase is considered "carrying load" for the
+// post-switch consistency check.
+#define PHASE_SWITCH_I_ON_THRESHOLD_MA 1000
+// Time (ms) to wait after pilot pause for vehicle current to settle to 0
+// before opening K1. IEC 61851-1 requires the vehicle to drop within 3 s;
+// we add safety margin.
+#define PHASE_SWITCH_PILOT_PAUSE_MS 4000UL
+// Settle time after opening K1 before K2 may be switched.
+#define PHASE_SWITCH_K1_OFF_SETTLE_MS 500UL
+// Settle time after K2 transition before pilot is re-enabled.
+#define PHASE_SWITCH_K2_SETTLE_MS 500UL
+// Grace period after K1 re-close before the post-switch plausibility check
+// runs. Some EVs need 10-30 s before they ramp up current.
+#define PHASE_SWITCH_PLAUSIBILITY_GRACE_MS 30000UL
+// Default per-CT scale factors if EEPROM is unprogrammed.
+#ifndef DEFAULT_CURRENT_SCALE_FACTOR_L2
+#define DEFAULT_CURRENT_SCALE_FACTOR_L2 DEFAULT_CURRENT_SCALE_FACTOR
+#endif
+#ifndef DEFAULT_CURRENT_SCALE_FACTOR_L3
+#define DEFAULT_CURRENT_SCALE_FACTOR_L3 DEFAULT_CURRENT_SCALE_FACTOR
+#endif
+#endif // PHASE_SWITCHING
+
+#ifdef RDC_DD
+// Periodic self-test interval for the external RDC-DD sensor.
+// IEC 62955 requires a self-test at least once per 24 h. We run once at
+// boot and then every 23 h to stay below the limit with comfortable margin.
+#define RDC_DD_SELFTEST_INTERVAL_MS (23UL * 60UL * 60UL * 1000UL)
+#endif // RDC_DD
 
 #ifdef TEMPERATURE_MONITORING
 

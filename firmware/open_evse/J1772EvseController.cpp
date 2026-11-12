@@ -55,7 +55,11 @@ static inline unsigned long ulong_sqrt(unsigned long in)
   return out;
 }
 
-void J1772EVSEController::readAmmeter()
+// Sample a single CT channel for ~one and a half mains cycles, computing
+// the RMS amplitude in raw ADC counts. Returns the RMS value or 0 if no
+// signal could be detected. Factored out of readAmmeter() so that the
+// 3-phase variant can reuse it without code duplication.
+static unsigned long sampleAmmeterChannel(AdcPin &adc)
 {
   WDT_RESET();
 
@@ -66,14 +70,8 @@ void J1772EVSEController::readAmmeter()
   uint16_t last_sample;
   unsigned int sample_count = 0;
   for(unsigned long start = millis(); ((now_ms = millis()) - start) < CURRENT_SAMPLE_INTERVAL; ) {
-    // the A/d is 0 to 1023.
-    uint16_t sample = adcCurrent.read();
-    // If this isn't the first sample, and if the sign of the value differs from the
-    // sign of the previous value, then count that as a zero crossing.
+    uint16_t sample = adc.read();
     if (!is_first_sample && ((last_sample > 512) != (sample > 512))) {
-      // Once we've seen a zero crossing, don't look for one for a little bit.
-      // It's possible that a little noise near zero could cause a two-sample
-      // inversion.
       if ((now_ms - last_zero_crossing_time) > CURRENT_ZERO_DEBOUNCE_INTERVAL) {
         zero_crossings++;
         last_zero_crossing_time = now_ms;
@@ -83,26 +81,44 @@ void J1772EVSEController::readAmmeter()
     last_sample = sample;
     switch(zero_crossings) {
     case 0:
-      continue; // Still waiting to start sampling
+      continue;
     case 1:
     case 2:
-      // Gather the sum-of-the-squares and count how many samples we've collected.
       sum += (unsigned long)(((long)sample - 512) * ((long)sample - 512));
       sample_count++;
       continue;
     case 3:
-      // The answer is the square root of the mean of the squares.
-      // But additionally, that value must be scaled to a real current value.
-      // we will do that elsewhere
-      m_AmmeterReading = ulong_sqrt(sum / sample_count);
-      return;
+      WDT_RESET();
+      return ulong_sqrt(sum / sample_count);
     }
   }
-  // ran out of time. Assume that it's simply not oscillating any.
-  m_AmmeterReading = 0;
-
   WDT_RESET();
+  return 0;
 }
+
+void J1772EVSEController::readAmmeter()
+{
+  m_AmmeterReading = sampleAmmeterChannel(adcCurrent);
+}
+
+#ifdef PHASE_SWITCHING
+void J1772EVSEController::readAmmeterPhase(uint8_t phase)
+{
+  switch (phase) {
+  case 0:
+    m_AmmeterReading = sampleAmmeterChannel(adcCurrent);
+    break;
+  case 1:
+    m_AmmeterReadingL2 = sampleAmmeterChannel(adcCurrentL2);
+    break;
+  case 2:
+    m_AmmeterReadingL3 = sampleAmmeterChannel(adcCurrentL3);
+    break;
+  default:
+    break;
+  }
+}
+#endif // PHASE_SWITCHING
 
 #define MA_PTS 32 // # points in moving average MUST BE power of 2
 #define MA_BITS 5 // log2(MA_PTS)
@@ -150,6 +166,10 @@ J1772EVSEController::J1772EVSEController() :
 #ifdef CURRENT_PIN
   , adcCurrent(CURRENT_PIN)
 #endif
+#ifdef PHASE_SWITCHING
+  , adcCurrentL2(AMMETER_L2_PIN)
+  , adcCurrentL3(AMMETER_L3_PIN)
+#endif // PHASE_SWITCHING
 #ifdef VOLTMETER_PIN
   , adcVoltMeter(VOLTMETER_PIN)
 #endif
@@ -157,6 +177,22 @@ J1772EVSEController::J1772EVSEController() :
 #ifdef STATE_TRANSITION_REQ_FUNC
   m_StateTransitionReqFunc = NULL;
 #endif // STATE_TRANSITION_REQ_FUNC
+#ifdef PHASE_SWITCHING
+  m_PhasesRequested = 1;
+  m_PhasesActual = 1;
+  m_PhasesObserved = 0;
+  m_PhaseFsmState = PFS_IDLE;
+  m_PhaseFsmStateMs = 0;
+  m_PhaseLastSwitchMs = 0;
+  m_PhaseSwitchPending = 0;
+  m_AmmeterReadingL2 = 0;
+  m_AmmeterReadingL3 = 0;
+  m_ChargingCurrentL2 = 0;
+  m_ChargingCurrentL3 = 0;
+#endif // PHASE_SWITCHING
+#ifdef RDC_DD
+  m_RdcDdLastSelfTestMs = 0;
+#endif // RDC_DD
 }
 
 void J1772EVSEController::SaveSettings()
@@ -291,9 +327,12 @@ void J1772EVSEController::chargingOn()
 #ifdef CHARGING_REG
     pinCharging.write(1);
 #endif
-#ifdef CHARGING2_REG
+#if defined(CHARGING2_REG) && !defined(PHASE_SWITCHING)
+    // With PHASE_SWITCHING enabled, CHARGING2 is repurposed as the K2
+    // phase contactor and must NOT be toggled from the main-relay path.
+    // The phase-switching FSM is the only entity that drives it.
     pinCharging2.write(1);
-#endif // CHARGING2_REG
+#endif // CHARGING2_REG && !PHASE_SWITCHING
 #ifdef OEV6
   }
 #endif // OEV6
@@ -332,9 +371,9 @@ void J1772EVSEController::chargingOff()
 #ifdef CHARGING_REG
     pinCharging.write(0);
 #endif
-#ifdef CHARGING2_REG
+#if defined(CHARGING2_REG) && !defined(PHASE_SWITCHING)
     pinCharging2.write(0);
-#endif
+#endif // CHARGING2_REG && !PHASE_SWITCHING
 #ifdef OEV6
   }
 #endif // OEV6
@@ -349,7 +388,11 @@ void J1772EVSEController::chargingOff()
 
 #ifdef AMMETER
   m_ChargingCurrent = 0;
-#endif
+#ifdef PHASE_SWITCHING
+  m_ChargingCurrentL2 = 0;
+  m_ChargingCurrentL3 = 0;
+#endif // PHASE_SWITCHING
+#endif // AMMETER
 }
 
 void J1772EVSEController::HardFault(int8_t recoverable)
@@ -984,6 +1027,23 @@ void J1772EVSEController::Init()
 #ifdef CHARGINGAC_REG
   pinChargingAC.init(CHARGINGAC_REG,CHARGINGAC_IDX,DigitalPin::OUT);
 #endif
+#ifdef PHASE_SWITCHING
+  // Initialise K2 output low (= 1-phase fall-back). This must happen
+  // BEFORE chargingOff() below, which is the actual "everything off"
+  // call at end of pin init.
+  pinPhaseContactor.init(PHASE_CONTACTOR_REG,PHASE_CONTACTOR_IDX,DigitalPin::OUT);
+  pinPhaseContactor.write(0);
+  m_PhasesRequested = 1;
+  m_PhasesActual = 1;
+  m_PhasesObserved = 0;
+  m_PhaseFsmState = PFS_IDLE;
+  m_PhaseFsmStateMs = millis();
+  // Pre-load the lockout so no phase switch is allowed for the first
+  // PHASE_SWITCH_LOCKOUT_MS after boot - lets the system settle before
+  // any K2 transition.
+  m_PhaseLastSwitchMs = millis();
+  m_PhaseSwitchPending = 0;
+#endif // PHASE_SWITCHING
 #ifdef ACLINE1_REG
   pinAC1.init(ACLINE1_REG,ACLINE1_IDX,DigitalPin::INP_PU);
 #endif
@@ -1065,6 +1125,20 @@ void J1772EVSEController::Init()
   
   m_AmmeterReading = 0;
   m_ChargingCurrent = 0;
+#ifdef PHASE_SWITCHING
+  m_CurrentScaleFactorL2 = eeprom_read_word((uint16_t*)EOFS_CURRENT_SCALE_FACTOR_L2);
+  m_CurrentScaleFactorL3 = eeprom_read_word((uint16_t*)EOFS_CURRENT_SCALE_FACTOR_L3);
+  if (m_CurrentScaleFactorL2 == (int16_t)0xffff) {
+    m_CurrentScaleFactorL2 = DEFAULT_CURRENT_SCALE_FACTOR_L2;
+  }
+  if (m_CurrentScaleFactorL3 == (int16_t)0xffff) {
+    m_CurrentScaleFactorL3 = DEFAULT_CURRENT_SCALE_FACTOR_L3;
+  }
+  m_AmmeterReadingL2 = 0;
+  m_AmmeterReadingL3 = 0;
+  m_ChargingCurrentL2 = 0;
+  m_ChargingCurrentL3 = 0;
+#endif // PHASE_SWITCHING
 #ifdef OVERCURRENT_THRESHOLD
   m_OverCurrentStartMs = 0;
 #endif //OVERCURRENT_THRESHOLD
@@ -1455,8 +1529,16 @@ void J1772EVSEController::Update(uint8_t forcetransition)
 	g_OBD.LcdMsg("Reset","GFI");
 	delay(250);
 #endif // FT_GFI_RETRY
+#ifdef RDC_DD
+	// External all-current-sensitive RDC-DD: a trip likely indicates
+	// a DC residual current. Auto-retry is not safe; require manual
+	// reset by the user (cycle pilot via unplugging the EV, or send
+	// a reset via RAPI/web UI).
+	HardFault(1);
+	return;
+#else
 	m_GfiRetryCnt++;
-	
+
 	if ((GFI_RETRY_COUNT != 255) && (m_GfiRetryCnt > GFI_RETRY_COUNT)) {
 	  HardFault(1);
 	  return;
@@ -1465,6 +1547,7 @@ void J1772EVSEController::Update(uint8_t forcetransition)
 	  m_Gfi.Reset();
 	  m_GfiFaultStartMs = 0;
 	}
+#endif // RDC_DD
       }
     }
 
@@ -1824,8 +1907,45 @@ if (TempChkEnabled()) {
       }
       g_OBD.SetAmmeterDirty(1);
     }
+#ifdef PHASE_SWITCHING
+    // Sample L2 and L3 in the same cycle. The MovingAverage above is
+    // L1-specific; for the supplementary phases we use an instantaneous
+    // RMS reading which is good enough for the plausibility check and
+    // for kWh accounting (which averages over the 250ms KWH interval).
+    readAmmeterPhase(1);
+    readAmmeterPhase(2);
+    if (m_PhasesActual == 3) {
+      m_ChargingCurrentL2 = (int32_t)m_AmmeterReadingL2 * m_CurrentScaleFactorL2
+                            - m_AmmeterCurrentOffset;
+      m_ChargingCurrentL3 = (int32_t)m_AmmeterReadingL3 * m_CurrentScaleFactorL3
+                            - m_AmmeterCurrentOffset;
+      if (m_ChargingCurrentL2 < 0) m_ChargingCurrentL2 = 0;
+      if (m_ChargingCurrentL3 < 0) m_ChargingCurrentL3 = 0;
+    }
+    else {
+      // K2 open - L2/L3 must be 0 (we still read them, but any non-zero
+      // value indicates either a welded K2 contact or noise pickup).
+      m_ChargingCurrentL2 = 0;
+      m_ChargingCurrentL3 = 0;
+    }
+#endif // PHASE_SWITCHING
 #endif // !FAKE_CHARGING_CURRENT
   }
+#ifdef PHASE_SWITCHING
+  else {
+    // Outside state C we still want fresh readings of all three CTs to
+    // satisfy the pre-K2 I=0 plausibility check.
+    readAmmeterPhase(0);
+    readAmmeterPhase(1);
+    readAmmeterPhase(2);
+    m_ChargingCurrent  = (int32_t)m_AmmeterReading   * m_CurrentScaleFactor   - m_AmmeterCurrentOffset;
+    m_ChargingCurrentL2 = (int32_t)m_AmmeterReadingL2 * m_CurrentScaleFactorL2 - m_AmmeterCurrentOffset;
+    m_ChargingCurrentL3 = (int32_t)m_AmmeterReadingL3 * m_CurrentScaleFactorL3 - m_AmmeterCurrentOffset;
+    if (m_ChargingCurrent  < 0) m_ChargingCurrent  = 0;
+    if (m_ChargingCurrentL2 < 0) m_ChargingCurrentL2 = 0;
+    if (m_ChargingCurrentL3 < 0) m_ChargingCurrentL3 = 0;
+  }
+#endif // PHASE_SWITCHING
 
 #ifdef OVERCURRENT_THRESHOLD
   if (m_EvseState == EVSE_STATE_C) {
@@ -1965,6 +2085,24 @@ if (TempChkEnabled()) {
     }
 #endif // TIME_LIMIT
   }
+
+#ifdef PHASE_SWITCHING
+  UpdatePhaseSwitching();
+#endif // PHASE_SWITCHING
+
+#ifdef RDC_DD
+  // Periodic RDC-DD self test. Skip during charging - a self test fires
+  // the device, which would interrupt the session. Only run when EV is
+  // disconnected (state A) or connected but idle (state B with K1 open).
+  if (!InFaultState() && !InHardFault() &&
+      ((m_EvseState == EVSE_STATE_A) ||
+       ((m_EvseState == EVSE_STATE_B) && !chargingIsOn()))) {
+    if ((m_RdcDdLastSelfTestMs == 0) ||
+        ((millis() - m_RdcDdLastSelfTestMs) >= RDC_DD_SELFTEST_INTERVAL_MS)) {
+      RunRdcDdSelfTest();
+    }
+  }
+#endif // RDC_DD
 
 #ifdef RAPI
     RapiSendEvseState();
@@ -2330,5 +2468,232 @@ uint8_t J1772EVSEController::SetMaxHwCurrentCapacity(uint8_t amps)
   }
   return 1;
 }
+
+#ifdef PHASE_SWITCHING
+//----------------------------------------------------------------------------
+// 1ph / 3ph phase switching
+//
+// Hardware: K1 (L1+N, 230V SSR output) and K2 (L2+L3, 12V output via
+// PHASE_CONTACTOR_REG). Per-phase CTs on L1/L2/L3 enable the I=0
+// plausibility check before any K2 transition.
+//
+// Sequence executed by the FSM (states defined in J1772EvseController.h):
+//   1. PFS_PAUSE_PILOT      - pilot to State B, wait for current to drop
+//   2. PFS_OPEN_K1          - K1 commanded open, settle
+//   3. PFS_SWITCH_K2        - K2 commanded to new position, settle
+//   4. PFS_RESUME_PILOT     - pilot re-enabled, EV may take charge again
+//   5. PFS_PLAUSIBILITY_GRACE - K1 re-closed via normal path, grace before
+//                              consistency check
+//   6. PFS_IDLE             - lockout enforced for PHASE_SWITCH_LOCKOUT_MS
+//----------------------------------------------------------------------------
+
+void J1772EVSEController::setPhaseContactor(uint8_t close)
+{
+  pinPhaseContactor.write(close ? 1 : 0);
+  m_PhasesActual = close ? 3 : 1;
+}
+
+uint8_t J1772EVSEController::getPhaseContactor()
+{
+  return pinPhaseContactor.read() ? 1 : 0;
+}
+
+unsigned long J1772EVSEController::GetPhaseLockoutRemainingMs()
+{
+  unsigned long elapsed = millis() - m_PhaseLastSwitchMs;
+  if (elapsed >= PHASE_SWITCH_LOCKOUT_MS) return 0;
+  return PHASE_SWITCH_LOCKOUT_MS - elapsed;
+}
+
+uint8_t J1772EVSEController::SetRequestedPhases(uint8_t phases)
+{
+  if ((phases != 1) && (phases != 3)) return 3; // invalid
+  if (InFaultState() || InHardFault()) return 2;
+
+  m_PhasesRequested = phases;
+  if (phases == m_PhasesActual) {
+    // already in target state - clear any pending flag
+    m_PhaseSwitchPending = 0;
+    return 0;
+  }
+
+  // Different from actual - the FSM tick will pick this up. Reject only
+  // if the lockout is still active and we are completely idle. If we are
+  // already in the middle of a transition, the next-target value will be
+  // honoured when the current transition completes.
+  if ((m_PhaseFsmState == PFS_IDLE) && (GetPhaseLockoutRemainingMs() > 0)) {
+    return 1;
+  }
+  m_PhaseSwitchPending = 1;
+  return 0;
+}
+
+void J1772EVSEController::UpdatePhasesObserved()
+{
+  // Classify charging current pattern. Only meaningful in state C with
+  // K1 closed and after the plausibility grace.
+  if ((m_EvseState != EVSE_STATE_C) || !chargingIsOn()) {
+    return;
+  }
+  uint8_t hot_l1 = (m_ChargingCurrent   >= PHASE_SWITCH_I_ON_THRESHOLD_MA) ? 1 : 0;
+  uint8_t hot_l2 = (m_ChargingCurrentL2 >= PHASE_SWITCH_I_ON_THRESHOLD_MA) ? 1 : 0;
+  uint8_t hot_l3 = (m_ChargingCurrentL3 >= PHASE_SWITCH_I_ON_THRESHOLD_MA) ? 1 : 0;
+  uint8_t n = hot_l1 + hot_l2 + hot_l3;
+  if (n > 0) m_PhasesObserved = n;
+}
+
+void J1772EVSEController::UpdatePhaseSwitching()
+{
+  unsigned long now = millis();
+  unsigned long state_age = now - m_PhaseFsmStateMs;
+
+  switch (m_PhaseFsmState) {
+
+  case PFS_IDLE: {
+    // Check for pending request and lockout cleared.
+    if (!m_PhaseSwitchPending) return;
+    if (m_PhasesRequested == m_PhasesActual) {
+      m_PhaseSwitchPending = 0;
+      return;
+    }
+    if (GetPhaseLockoutRemainingMs() > 0) return;
+    if (InFaultState() || InHardFault()) {
+      // do not start a phase change in fault state
+      return;
+    }
+    // If charging is not active, take the shortcut: K2 may be safely
+    // switched immediately (the contactors are already de-energized).
+    if (!chargingIsOn() && (m_EvseState != EVSE_STATE_C)) {
+      // Verify all three CTs report <= I_OFF_THRESHOLD. Out of caution
+      // we also re-sample once.
+      readAmmeterPhase(0); readAmmeterPhase(1); readAmmeterPhase(2);
+      int32_t i_l1 = (int32_t)m_AmmeterReading   * m_CurrentScaleFactor   - m_AmmeterCurrentOffset;
+      int32_t i_l2 = (int32_t)m_AmmeterReadingL2 * m_CurrentScaleFactorL2 - m_AmmeterCurrentOffset;
+      int32_t i_l3 = (int32_t)m_AmmeterReadingL3 * m_CurrentScaleFactorL3 - m_AmmeterCurrentOffset;
+      if ((i_l1 < PHASE_SWITCH_I_OFF_THRESHOLD_MA) &&
+          (i_l2 < PHASE_SWITCH_I_OFF_THRESHOLD_MA) &&
+          (i_l3 < PHASE_SWITCH_I_OFF_THRESHOLD_MA)) {
+        setPhaseContactor((m_PhasesRequested == 3) ? 1 : 0);
+        m_PhaseLastSwitchMs = now;
+        m_PhaseSwitchPending = 0;
+        return;
+      }
+      // current still flowing somewhere - fall through to full sequence
+    }
+    // Full sequence required. Pull pilot to State B.
+    m_Pilot.SetState(PILOT_STATE_P12); // +12V solid = State A signaling
+    m_PhaseFsmState = PFS_PAUSE_PILOT;
+    m_PhaseFsmStateMs = now;
+    break;
+  }
+
+  case PFS_PAUSE_PILOT: {
+    if (state_age < PHASE_SWITCH_PILOT_PAUSE_MS) return;
+    // After the pause, verify current really has dropped on all phases.
+    int32_t i_l1 = m_ChargingCurrent;
+    int32_t i_l2 = m_ChargingCurrentL2;
+    int32_t i_l3 = m_ChargingCurrentL3;
+    if ((i_l1 >= PHASE_SWITCH_I_OFF_THRESHOLD_MA) ||
+        (i_l2 >= PHASE_SWITCH_I_OFF_THRESHOLD_MA) ||
+        (i_l3 >= PHASE_SWITCH_I_OFF_THRESHOLD_MA)) {
+      // EV did not honour the pause - cannot safely switch K2.
+      // Open K1 anyway (the safer fall-back) and abort the sequence.
+      chargingOff();
+      m_PhaseSwitchPending = 0;
+      m_PhaseLastSwitchMs = now; // restart lockout to avoid hammering
+      m_PhaseFsmState = PFS_IDLE;
+      m_PhaseFsmStateMs = now;
+      // Restore PWM so the normal recovery path can run.
+      SetCurrentCapacity(GetCurrentCapacity(),0,1);
+      return;
+    }
+    chargingOff(); // open K1
+    m_PhaseFsmState = PFS_OPEN_K1;
+    m_PhaseFsmStateMs = now;
+    break;
+  }
+
+  case PFS_OPEN_K1: {
+    if (state_age < PHASE_SWITCH_K1_OFF_SETTLE_MS) return;
+    setPhaseContactor((m_PhasesRequested == 3) ? 1 : 0);
+    m_PhaseFsmState = PFS_SWITCH_K2;
+    m_PhaseFsmStateMs = now;
+    break;
+  }
+
+  case PFS_SWITCH_K2: {
+    if (state_age < PHASE_SWITCH_K2_SETTLE_MS) return;
+    // Re-enable pilot. Normal J1772 logic will pick up from here:
+    // EV ramps to State C, then chargingOn() closes K1 again.
+    SetCurrentCapacity(GetCurrentCapacity(),0,1);
+    m_PhaseFsmState = PFS_RESUME_PILOT;
+    m_PhaseFsmStateMs = now;
+    m_PhaseSwitchPending = 0;
+    m_PhaseLastSwitchMs = now; // lockout starts now
+    break;
+  }
+
+  case PFS_RESUME_PILOT: {
+    // Wait until either K1 closes again (EV has taken the offer) or a
+    // longer timeout elapses. We move to PLAUSIBILITY_GRACE on K1 close.
+    if (chargingIsOn()) {
+      m_PhaseFsmState = PFS_PLAUSIBILITY_GRACE;
+      m_PhaseFsmStateMs = now;
+      return;
+    }
+    // EV not interested for a while - that is fine, drop to IDLE.
+    if (state_age > 120000UL) {
+      m_PhaseFsmState = PFS_IDLE;
+      m_PhaseFsmStateMs = now;
+    }
+    break;
+  }
+
+  case PFS_PLAUSIBILITY_GRACE: {
+    if (state_age < PHASE_SWITCH_PLAUSIBILITY_GRACE_MS) return;
+    UpdatePhasesObserved();
+    // Consistency check vs. m_PhasesActual:
+    //   - 1ph mode: L2 and L3 MUST be 0. Any current there = welded K2.
+    //   - 3ph mode: at least L1 should carry current; absence of L2/L3
+    //     while L1 is hot is the e-Golf case (2-phase) and acceptable.
+    if (m_PhasesActual == 1) {
+      if ((m_ChargingCurrentL2 >= PHASE_SWITCH_I_ON_THRESHOLD_MA) ||
+          (m_ChargingCurrentL3 >= PHASE_SWITCH_I_ON_THRESHOLD_MA)) {
+        // hard fault - welded K2 in 1ph mode is unsafe
+        chargingOff();
+        m_EvseState = EVSE_STATE_RELAY_CLOSURE_FAULT;
+        HardFault(0);
+        return;
+      }
+    }
+    m_PhaseFsmState = PFS_IDLE;
+    m_PhaseFsmStateMs = now;
+    break;
+  }
+
+  default:
+    m_PhaseFsmState = PFS_IDLE;
+    m_PhaseFsmStateMs = now;
+    break;
+  }
+}
+#endif // PHASE_SWITCHING
+
+#ifdef RDC_DD
+uint8_t J1772EVSEController::RunRdcDdSelfTest()
+{
+#ifdef GFI_SELFTEST
+  uint8_t rc = m_Gfi.SelfTest();
+  if (rc == 0) {
+    m_RdcDdLastSelfTestMs = millis();
+  }
+  return rc;
+#else
+  // No self-test pin available -> cannot verify, but do not block.
+  m_RdcDdLastSelfTestMs = millis();
+  return 0;
+#endif
+}
+#endif // RDC_DD
 
 //-- end J1772EVSEController

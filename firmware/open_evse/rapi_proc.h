@@ -213,6 +213,16 @@ SV mv - Set Voltage for power calculations to mv millivolts
  NOTES:
   - only available if VOLTMETER not defined and KWH_RECORDING defined
   - volatile - value is lost, and replaced with VOLTS_FOR_Lx at boot
+SP phases - set requested phase configuration (requires PHASE_SWITCHING)
+ phases: 1 = single-phase, 3 = three-phase
+ response:
+   $OK actual_phases - accepted, transition will begin
+   $NK 1 - rejected: anti-hunt lockout still active
+   $NK 2 - rejected: EVSE in fault state
+   $NK 3 - rejected: invalid phases value
+ $SP 3 - request three-phase operation
+ $SP 1 - request single-phase operation
+
 SY heartbeatinterval hearbeatcurrentlimit
  Response includes heartbeatinterval hearbeatcurrentlimit hearbeattrigger
  hearbeattrigger: 0 - There has never been a missed pulse, 
@@ -345,6 +355,21 @@ T0 amps - set fake charging current
  response: $OK
  $T0 75
  
+GN - get per-phase currents (requires PHASE_SWITCHING)
+ response: $OK milliamps_l1 milliamps_l2 milliamps_l3
+ all values decimal. In single-phase mode L2 and L3 read 0.
+ $GN
+
+GW - get phase switching state (requires PHASE_SWITCHING)
+ response: $OK phases_actual phases_requested switching lockout_remaining_ms observed_phases
+   phases_actual    - 1 or 3, current K2 position
+   phases_requested - 1 or 3, last accepted SP request
+   switching        - 0 if FSM is idle, 1..5 if a transition is in progress
+   lockout_remaining_ms - milliseconds until next SP request is allowed
+   observed_phases  - 1, 2 (e-Golf-style) or 3 - phases the vehicle is
+                      actually drawing current on (0 if unknown yet)
+ $GW
+
 GY - Get Hearbeat Supervision Status
  Response includes heartbeatinterval hearbeatcurrentlimit hearbeattrigger
  hearbeattrigger: 0 - There has never been a missed pulse, 
